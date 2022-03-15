@@ -1,11 +1,43 @@
 import numpy as np
-from numba import njit, prange
+from numba import njit, prange, set_num_threads, get_num_threads
 from numpy import zeros_like, sqrt
 from .kernel import *
 from .octree import *
 from .dynamic_tree import *
 from .treewalk import *
 from .bruteforce import *
+
+TOTAL_THREADS = get_num_threads()
+
+def _isParallel(parallel):
+    if isinstance(parallel, bool):
+        if parallel:
+            set_num_threads(TOTAL_THREADS)
+        return parallel
+    elif isinstance(parallel, int):
+        if parallel > 1:
+            set_num_threads(min(parallel, TOTAL_THREADS))
+            return True
+        else:
+            return False
+    else:
+        return False
+
+def _fix1DArr(*arrays):
+    ret = []
+    for arr in arrays:
+        if arr is not None: arr = np.asarray([arr], dtype=float).ravel()
+        ret.append(arr)
+    return ret[0] if len(ret) == 1 else ret
+
+def _fixNDArr(*arrays):
+    ret = []
+    for arr in arrays:
+        if arr is not None:
+            arr = np.asarray(arr, dtype=float)
+            if arr.shape == (3,): arr = arr[np.newaxis,:]
+        ret.append(arr)
+    return ret[0] if len(ret) == 1 else ret
 
 def valueTestMethod(method):
     methods = ["adaptive","bruteforce","tree"]
@@ -18,7 +50,7 @@ def valueTestMethod(method):
     if method not in methods:
         raise ValueError("Invalid method %s. Must be one of: %s"%(method,str(methods)))
 
-def ConstructTree(pos,m,softening=None,quadrupole=False,vel=None):
+def ConstructTree(pos, m, softening=None, quadrupole=False, vel=None):
     """Builds a tree containing particle data, for subsequent potential/field evaluation
 
     Parameters
@@ -48,7 +80,7 @@ def ConstructTree(pos,m,softening=None,quadrupole=False,vel=None):
     else:
         return DynamicOctree(pos, m,softening,vel, quadrupole=quadrupole)
 
-def Potential(pos, m, softening=None, G=1., theta=.7, tree=None, return_tree=False,parallel=False,method='adaptive',quadrupole=False):
+def Potential(pos, m, softening=None, G=1., theta=.7, tree=None, return_tree=False, parallel=False, method='adaptive', quadrupole=False):
     """Gravitational potential calculation
 
     Returns the gravitational potential for a set of particles with positions x and masses m, at the positions of those particles, using either brute force or tree-based methods depending on the number of particles.
@@ -65,8 +97,9 @@ def Potential(pos, m, softening=None, G=1., theta=.7, tree=None, return_tree=Fal
         shape (N,) array containing kernel support radii for gravitational softening -  - these give the radius of compact support of the M4 cubic spline mass distribution - set to 0 by default
     theta: float, optional
         cell opening angle used to control force accuracy; smaller is slower (runtime ~ theta^-3) but more accurate. (default 0.7, gives ~1% accuracy)
-    parallel: bool, optional
-        If True, will parallelize the force summation over all available cores. (default False)
+    parallel: bool | int, optional
+        If True, will parallelize the force summation over all available cores.
+        It can also be the number of cores to use for parallel processing. (default False)
     tree: Octree, optional
         optional pre-generated Octree: this can contain any set of particles, not necessarily the target particles at pos (default None)
     return_tree: bool, optional
@@ -85,6 +118,10 @@ def Potential(pos, m, softening=None, G=1., theta=.7, tree=None, return_tree=Fal
     ## test if method is correct, otherwise raise a ValueError
     valueTestMethod(method)
 
+    # soft np.array casting
+    pos = _fixNDArr(pos)
+    m, softening = _fix1DArr(m, softening)
+
     if softening is None: softening = np.zeros_like(m)
 
     # figure out which method to use
@@ -93,10 +130,12 @@ def Potential(pos, m, softening=None, G=1., theta=.7, tree=None, return_tree=Fal
         else: method = 'bruteforce'
 
     if method == 'bruteforce': # we're using brute force
-        if parallel:
+        if _isParallel(parallel):
             phi = Potential_bruteforce_parallel(pos,m,softening,G=G)
+            set_num_threads(TOTAL_THREADS) # we reset NUMBA_NUM_THREADS
         else:
             phi = Potential_bruteforce(pos,m,softening,G=G)
+
         if return_tree:
             tree = None
     else: # we're using the tree algorithm
@@ -108,8 +147,9 @@ def Potential(pos, m, softening=None, G=1., theta=.7, tree=None, return_tree=Fal
         pos_sorted = np.take(pos,idx,axis=0)
         h_sorted = np.take(softening,idx)
         
-        if parallel:
+        if _isParallel(parallel):
             phi = PotentialTarget_tree_parallel(pos_sorted,h_sorted,tree,theta=theta,G=G,quadrupole=quadrupole)
+            set_num_threads(TOTAL_THREADS) # we reset NUMBA_NUM_THREADS
         else:
             phi = PotentialTarget_tree(pos_sorted,h_sorted,tree,theta=theta,G=G,quadrupole=quadrupole)
 
@@ -143,7 +183,8 @@ def PotentialTarget(pos_target, pos_source, m_source, softening_target=None, sof
     theta: float, optional
         cell opening angle used to control force accuracy; smaller is slower (runtime ~ theta^-3) but more accurate. (default 0.7, gives ~1% accuracy)
     parallel: bool, optional
-        If True, will parallelize the force summation over all available cores. (default False)
+        If True, will parallelize the force summation over all available cores.
+        It can also be the number of cores to use for parallel processing. (default False)
     tree: Octree, optional
         optional pre-generated Octree: this can contain any set of particles, not necessarily the target particles at pos (default None)
     return_tree: bool, optional
@@ -167,6 +208,10 @@ def PotentialTarget(pos_target, pos_source, m_source, softening_target=None, sof
     if tree is None and (pos_source is None or m_source is None):
         raise ValueError("Must pass either pos_source & m_source or source tree.")
 
+    # soft np.array casting. Also, soft fix in case a single target point is given.
+    pos_target, pos_source = _fixNDArr(pos_target, pos_source)
+    m_source, softening_target, softening_source = _fix1DArr(m_source, softening_target, softening_source)
+
     if softening_target is None: softening_target = np.zeros(len(pos_target))
     if softening_source is None and pos_source is not None: softening_source = np.zeros(len(pos_source))
 
@@ -176,8 +221,9 @@ def PotentialTarget(pos_target, pos_source, m_source, softening_target=None, sof
         else: method = 'bruteforce'
 
     if method == 'bruteforce': # we're using brute force
-        if parallel:
+        if _isParallel(parallel):
             phi = PotentialTarget_bruteforce_parallel(pos_target,softening_target,pos_source,m_source,softening_source,G=G)
+            set_num_threads(TOTAL_THREADS) # we reset NUMBA_NUM_THREADS
         else:
             phi = PotentialTarget_bruteforce(pos_target,softening_target,pos_source,m_source,softening_source,G=G)
         if return_tree:
@@ -185,8 +231,9 @@ def PotentialTarget(pos_target, pos_source, m_source, softening_target=None, sof
     else: # we're using the tree algorithm
         if tree is None:
             tree = ConstructTree(np.float64(pos_source),np.float64(m_source), np.float64(softening_source), quadrupole=quadrupole) # build the tree if needed                    
-        if parallel:
+        if _isParallel(parallel):
             phi = PotentialTarget_tree_parallel(pos_target,softening_target,tree,theta=theta,G=G,quadrupole=quadrupole)
+            set_num_threads(TOTAL_THREADS) # we reset NUMBA_NUM_THREADS
         else:
             phi = PotentialTarget_tree(pos_target,softening_target,tree,theta=theta,G=G,quadrupole=quadrupole)
 
@@ -196,7 +243,7 @@ def PotentialTarget(pos_target, pos_source, m_source, softening_target=None, sof
         return phi
             
 
-def Accel(pos, m, softening=None, G=1., theta=.7, tree=None, return_tree=False,parallel=False,method='adaptive',quadrupole=False):
+def Accel(pos, m, softening=None, G=1., theta=.7, tree=None, return_tree=False, parallel=False, method='adaptive', quadrupole=False):
     """Gravitational acceleration calculation
 
     Returns the gravitational acceleration for a set of particles with positions x and masses m, at the positions of those particles, using either brute force or tree-based methods depending on the number of particles.
@@ -214,7 +261,8 @@ def Accel(pos, m, softening=None, G=1., theta=.7, tree=None, return_tree=False,p
     theta: float, optional
         cell opening angle used to control force accuracy; smaller is slower (runtime ~ theta^-3) but more accurate. (default 0.7, gives ~1% accuracy)
     parallel: bool, optional
-        If True, will parallelize the force summation over all available cores. (default False)
+        If True, will parallelize the force summation over all available cores.
+        It can also be the number of cores to use for parallel processing. (default False)
     tree: Octree, optional
         optional pre-generated Octree: this can contain any set of particles, not necessarily the target particles at pos (default None)
     return_tree: bool, optional
@@ -233,6 +281,10 @@ def Accel(pos, m, softening=None, G=1., theta=.7, tree=None, return_tree=False,p
     ## test if method is correct, otherwise raise a ValueError
     valueTestMethod(method)
 
+    # soft np.array casting
+    pos = _fixNDArr(pos)
+    m, softening = _fix1DArr(m, softening)
+
     if softening is None: softening = np.zeros_like(m)
 
     # figure out which method to use
@@ -241,8 +293,9 @@ def Accel(pos, m, softening=None, G=1., theta=.7, tree=None, return_tree=False,p
         else: method = 'bruteforce'
 
     if method == 'bruteforce': # we're using brute force
-        if parallel:
+        if _isParallel(parallel):
             g = Accel_bruteforce_parallel(pos,m,softening,G=G)
+            set_num_threads(TOTAL_THREADS) # we reset NUMBA_NUM_THREADS
         else:
             g = Accel_bruteforce(pos,m,softening,G=G)
         if return_tree:
@@ -256,8 +309,9 @@ def Accel(pos, m, softening=None, G=1., theta=.7, tree=None, return_tree=False,p
         pos_sorted = np.take(pos,idx,axis=0)
         h_sorted = np.take(softening,idx)
         
-        if parallel:
+        if _isParallel(parallel):
             g = AccelTarget_tree_parallel(pos_sorted,h_sorted,tree,theta=theta,G=G,quadrupole=quadrupole)
+            set_num_threads(TOTAL_THREADS) # we reset NUMBA_NUM_THREADS
         else:
             g = AccelTarget_tree(pos_sorted,h_sorted,tree,theta=theta,G=G,quadrupole=quadrupole)
 
@@ -291,7 +345,8 @@ def AccelTarget(pos_target, pos_source, m_source, softening_target=None, softeni
     theta: float, optional
         cell opening angle used to control force accuracy; smaller is slower (runtime ~ theta^-3) but more accurate. (default 0.7, gives ~1% accuracy)
     parallel: bool, optional
-        If True, will parallelize the force summation over all available cores. (default False)
+        If True, will parallelize the force summation over all available cores.
+        It can also be the number of cores to use for parallel processing. (default False)
     tree: Octree, optional
         optional pre-generated Octree: this can contain any set of particles, not necessarily the target particles at pos (default None)
     return_tree: bool, optional
@@ -315,6 +370,10 @@ def AccelTarget(pos_target, pos_source, m_source, softening_target=None, softeni
     if tree is None and (pos_source is None or m_source is None):
         raise ValueError("Must pass either pos_source & m_source or source tree.")
 
+    # soft np.array casting. Also, soft fix in case a single target point is given.
+    pos_target, pos_source = _fixNDArr(pos_target, pos_source)
+    m_source, softening_target, softening_source = _fix1DArr(m_source, softening_target, softening_source)
+    
     if softening_target is None: softening_target = np.zeros(len(pos_target))
     if softening_source is None and pos_source is not None: softening_source = np.zeros(len(pos_source))
 
@@ -324,16 +383,18 @@ def AccelTarget(pos_target, pos_source, m_source, softening_target=None, softeni
         else: method = 'bruteforce'
 
     if method == 'bruteforce': # we're using brute force
-        if parallel:
+        if _isParallel(parallel):
             g = AccelTarget_bruteforce_parallel(pos_target,softening_target,pos_source,m_source,softening_source,G=G)
+            set_num_threads(TOTAL_THREADS) # we reset NUMBA_NUM_THREADS
         else:
             g = AccelTarget_bruteforce(pos_target,softening_target,pos_source,m_source,softening_source,G=G)
         if return_tree:
             tree = None
     else: # we're using the tree algorithm
         if tree is None: tree = ConstructTree(np.float64(pos_source),np.float64(m_source), np.float64(softening_source), quadrupole=quadrupole) # build the tree if needed
-        if parallel:
+        if _isParallel(parallel):
             g = AccelTarget_tree_parallel(pos_target,softening_target,tree,theta=theta,G=G,quadrupole=quadrupole)
+            set_num_threads(TOTAL_THREADS) # we reset NUMBA_NUM_THREADS
         else:
             g = AccelTarget_tree(pos_target,softening_target,tree,theta=theta,G=G,quadrupole=quadrupole)
 
@@ -342,7 +403,7 @@ def AccelTarget(pos_target, pos_source, m_source, softening_target=None, softeni
     else:
         return g
 
-def DensityCorrFunc(pos, m, rbins=None, max_bin_size_ratio=100, theta=1., tree=None, return_tree=False, parallel=False,boxsize=0,weighted_binning=False):
+def DensityCorrFunc(pos, m, rbins=None, max_bin_size_ratio=100, theta=1., tree=None, return_tree=False, parallel=False, boxsize=0, weighted_binning=False):
     """Computes the average amount of mass in radial bin [r,r+dr] around a point, provided a set of radial bins.
 
     Parameters
@@ -358,7 +419,8 @@ def DensityCorrFunc(pos, m, rbins=None, max_bin_size_ratio=100, theta=1., tree=N
     theta: float, optional
         cell opening angle used to control accuracy; smaller is slower (runtime ~ theta^-3) but more accurate. (default 1.0)
     parallel: bool, optional
-        If True, will parallelize the correlation function computation over all available cores. (default False)
+        If True, will parallelize the correlation function computation over all available cores.
+        It can also be the number of cores to use for parallel processing. (default False)
     tree: Octree, optional
         optional pre-generated Octree: this can contain any set of particles, not necessarily the target particles at pos (default None)
     return_tree: bool, optional
@@ -388,8 +450,9 @@ def DensityCorrFunc(pos, m, rbins=None, max_bin_size_ratio=100, theta=1., tree=N
     # sort by the order they appear in the treewalk to improve access pattern efficiency
     pos_sorted = np.take(pos,idx,axis=0)
         
-    if parallel:
+    if _isParallel(parallel):
         mbins = DensityCorrFunc_tree_parallel(pos_sorted,tree, rbins, max_bin_size_ratio=max_bin_size_ratio,theta=theta,boxsize=boxsize,weighted_binning=weighted_binning)
+        set_num_threads(TOTAL_THREADS) # we reset NUMBA_NUM_THREADS
     else:
         mbins = DensityCorrFunc_tree(pos_sorted,tree, rbins, max_bin_size_ratio=max_bin_size_ratio,theta=theta,boxsize=boxsize,weighted_binning=weighted_binning)
 
@@ -398,7 +461,7 @@ def DensityCorrFunc(pos, m, rbins=None, max_bin_size_ratio=100, theta=1., tree=N
     else:
         return rbins, mbins
 
-def VelocityCorrFunc(pos, m, v, rbins=None, max_bin_size_ratio=100, theta=1., tree=None, return_tree=False, parallel=False,boxsize=0,weighted_binning=False):
+def VelocityCorrFunc(pos, m, v, rbins=None, max_bin_size_ratio=100, theta=1., tree=None, return_tree=False, parallel=False, boxsize=0, weighted_binning=False):
     """Computes the weighted average product v(x).v(x+r), for a vector field v, in radial bins
 
     Parameters
@@ -416,7 +479,8 @@ def VelocityCorrFunc(pos, m, v, rbins=None, max_bin_size_ratio=100, theta=1., tr
     theta: float, optional
         cell opening angle used to control accuracy; smaller is slower (runtime ~ theta^-3) but more accurate. (default 1.0)
     parallel: bool, optional
-        If True, will parallelize the correlation function computation over all available cores. (default False)
+        If True, will parallelize the correlation function computation over all available cores.
+        It can also be the number of cores to use for parallel processing. (default False)
     tree: Octree, optional
         optional pre-generated Octree: this can contain any set of particles, not necessarily the target particles at pos (default None)
     return_tree: bool, optional
@@ -447,8 +511,9 @@ def VelocityCorrFunc(pos, m, v, rbins=None, max_bin_size_ratio=100, theta=1., tr
     pos_sorted = np.take(pos,idx,axis=0)
     v_sorted = np.take(v, idx, axis=0)
     wt_sorted = np.take(m,idx,axis=0)
-    if parallel:
+    if _isParallel(parallel):
         corr = VelocityCorrFunc_tree_parallel(pos_sorted, v_sorted, wt_sorted, tree, rbins, max_bin_size_ratio=max_bin_size_ratio,theta=theta,boxsize=boxsize,weighted_binning=weighted_binning)
+        set_num_threads(TOTAL_THREADS) # we reset NUMBA_NUM_THREADS
     else:
         corr = VelocityCorrFunc_tree(pos_sorted, v_sorted, wt_sorted, tree, rbins, max_bin_size_ratio=max_bin_size_ratio,theta=theta,boxsize=boxsize,weighted_binning=weighted_binning)
 
@@ -457,7 +522,7 @@ def VelocityCorrFunc(pos, m, v, rbins=None, max_bin_size_ratio=100, theta=1., tr
     else:
         return rbins, corr
 
-def VelocityStructFunc(pos, m, v, rbins=None, max_bin_size_ratio=100, theta=1., tree=None, return_tree=False, parallel=False,boxsize=0,weighted_binning=False):
+def VelocityStructFunc(pos, m, v, rbins=None, max_bin_size_ratio=100, theta=1., tree=None, return_tree=False, parallel=False,boxsize=0, weighted_binning=False):
     """Computes the structure function for a vector field: the average value of |v(x)-v(x+r)|^2, in radial bins for r
 
     Parameters
@@ -475,7 +540,8 @@ def VelocityStructFunc(pos, m, v, rbins=None, max_bin_size_ratio=100, theta=1., 
     theta: float, optional
         cell opening angle used to control accuracy; smaller is slower (runtime ~ theta^-3) but more accurate. (default 1.0)
     parallel: bool, optional
-        If True, will parallelize the correlation function computation over all available cores. (default False)
+        If True, will parallelize the correlation function computation over all available cores.
+        It can also be the number of cores to use for parallel processing. (default False)
     tree: Octree, optional
         optional pre-generated Octree: this can contain any set of particles, not necessarily the target particles at pos (default None)
     return_tree: bool, optional
@@ -506,8 +572,9 @@ def VelocityStructFunc(pos, m, v, rbins=None, max_bin_size_ratio=100, theta=1., 
     pos_sorted = np.take(pos,idx,axis=0)
     v_sorted = np.take(v, idx, axis=0)
     wt_sorted = np.take(m,idx,axis=0)
-    if parallel:
+    if _isParallel(parallel):
         Sv = VelocityStructFunc_tree_parallel(pos_sorted, v_sorted, wt_sorted, tree, rbins, max_bin_size_ratio=max_bin_size_ratio,theta=theta,boxsize=boxsize,weighted_binning=weighted_binning)
+        set_num_threads(TOTAL_THREADS) # we reset NUMBA_NUM_THREADS
     else:
         Sv = VelocityStructFunc_tree(pos_sorted, v_sorted, wt_sorted, tree, rbins, max_bin_size_ratio=max_bin_size_ratio,theta=theta,boxsize=boxsize,weighted_binning=weighted_binning)
 
